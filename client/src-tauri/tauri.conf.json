@@ -1,0 +1,42 @@
+{
+  "$schema": "../node_modules/@tauri-apps/cli/schema.json",
+  "build": {
+    "beforeDevCommand":   "",
+    "beforeBuildCommand": "",
+    "devPath":  "../dist",
+    "distDir":  "../dist"
+  },
+  "package": {
+    "productName": "SquadVox",
+    "version":     "1.0.0"
+  },
+  "tauri": {
+    "allowlist": {
+      "all": false
+    },
+    "bundle": {
+      "active":     true,
+      "targets":    "all",
+      "identifier": "ru.squadvox.app",
+      "icon":       ["icons/icon.ico"]
+    },
+    "security": {
+      "csp": "default-src 'self'; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; connect-src https://squadvox.ru wss://squadvox.ru; media-src *; img-src *"
+    },
+    "updater": {
+      "active": false
+    },
+    "windows": [
+      {
+        "title":      "SquadVox",
+        "width":      860,
+        "height":     640,
+        "minWidth":   640,
+        "minHeight":  480,
+        "fullscreen": false,
+        "resizable":  true,
+        "center":     true
+      }
+    ]
+  }
+}

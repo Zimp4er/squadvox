@@ -1,0 +1,39 @@
+services:
+  signaling:
+    build: ./server
+    restart: unless-stopped
+    env_file: .env
+    expose:
+      - "3000"
+    volumes:
+      - ./data:/app/data   # сессии сохраняются между перезапусками
+    networks:
+      - squadvox
+
+  nginx:
+    build: ./nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      # Mount existing Let's Encrypt certs from host
+      - /etc/letsencrypt:/etc/letsencrypt:ro
+    depends_on:
+      - signaling
+    networks:
+      - squadvox
+
+  coturn:
+    image: coturn/coturn:latest
+    restart: unless-stopped
+    # Host network so TURN relay works without mapping 10k+ ports
+    network_mode: host
+    env_file: .env
+    volumes:
+      - ./coturn/entrypoint.sh:/entrypoint.sh:ro
+    entrypoint: /bin/sh /entrypoint.sh
+
+networks:
+  squadvox:
+    driver: bridge

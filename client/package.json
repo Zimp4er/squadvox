@@ -1,0 +1,43 @@
+{
+  "name": "squadvox",
+  "version": "1.0.0",
+  "description": "Private voice & screen share app",
+  "author": "Zimp4er",
+  "private": true,
+  "main": "electron.js",
+  "scripts": {
+    "dev":   "node node_modules/electron/cli.js . --dev",
+    "build": "electron-builder --win",
+    "release": "electron-builder --win --publish always",
+    "start": "node node_modules/electron/cli.js ."
+  },
+  "devDependencies": {
+    "electron":         "^33.0.0",
+    "electron-builder": "^25.1.8"
+  },
+  "dependencies": {
+    "@sapphi-red/web-noise-suppressor": "^0.3.5"
+  },
+  "build": {
+    "appId":       "ru.squadvox.app",
+    "productName": "SquadVox",
+    "directories": { "output": "release" },
+    "files": ["electron.js", "preload.js", "dist/**"],
+    "win": {
+      "target": [{ "target": "nsis", "arch": ["x64"] }],
+      "icon": "dist/icon.ico"
+    },
+    "nsis": {
+      "oneClick": true,
+      "deleteAppDataOnUninstall": false
+    },
+    "publish": {
+    "provider": "github",
+    "owner": "zimp4er",
+    "repo": "squadvox"
+    },
+
+    "compression": "maximum",
+    "asar": true
+  }
+}

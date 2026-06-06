@@ -1,0 +1,10 @@
+.env
+node_modules/
+target/
+dist/
+!client/dist/
+client/release/
+*.dmg
+*.AppImage
+*.deb
+*.msi
