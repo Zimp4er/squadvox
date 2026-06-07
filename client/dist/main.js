@@ -32,9 +32,10 @@ const state = {
 // One shared AudioContext + MediaStreamDestination + <audio> for all peers.
 // Each peer gets its own GainNode so volume can be adjusted per-user.
 
-let _outCtx  = null;
-let _outDest = null;
-let _outEl   = null;
+let _outCtx     = null;
+let _outDest    = null;
+let _outEl      = null;
+let _outHB      = null; // heartbeat to keep context alive
 const _peerGain = new Map(); // peerName → GainNode
 
 function ensureOutputCtx() {
@@ -45,13 +46,22 @@ function ensureOutputCtx() {
   _outCtx  = new AudioContext();
   _outDest = _outCtx.createMediaStreamDestination();
   _outCtx.resume().catch(() => {});
+
+  // Keep the context alive — browsers can suspend it after a few seconds of silence
+  if (_outHB) clearInterval(_outHB);
+  _outHB = setInterval(() => {
+    if (_outCtx?.state === 'suspended') _outCtx.resume().catch(() => {});
+  }, 2000);
+
   if (_outEl) _outEl.remove();
   _outEl = Object.assign(document.createElement('audio'), { autoplay: true });
   _outEl.srcObject = _outDest.stream;
   document.body.appendChild(_outEl);
+  _outEl.play().catch(() => {});
 }
 
 function destroyOutputCtx() {
+  if (_outHB) { clearInterval(_outHB); _outHB = null; }
   _peerGain.clear();
   if (_outCtx) { _outCtx.close(); _outCtx = null; }
   if (_outEl)  { _outEl.remove(); _outEl  = null; }
@@ -510,29 +520,21 @@ function openPeer(peerName) {
   const pc = new RTCPeerConnection(iceConfig());
   state.peers.set(peerName, pc);
 
-  const polite = state.username > peerName;
-  let makingOffer = false;
-  let ignoreOffer = false;
-  state.peerMeta.set(peerName, {
-    get makingOffer() { return makingOffer; },
-    set makingOffer(v) { makingOffer = v; },
-    get ignoreOffer() { return ignoreOffer; },
-    set ignoreOffer(v) { ignoreOffer = v; },
-    polite,
-  });
+  // Plain object — simpler than getters/setters, works the same way
+  const meta = { makingOffer: false, ignoreOffer: false, polite: state.username > peerName };
+  state.peerMeta.set(peerName, meta);
 
-  // Add local mic track
-  const stream = state.rawStream;
-  if (stream) stream.getTracks().forEach(t => pc.addTrack(t, stream));
-
+  // Set ALL event handlers BEFORE addTrack so onnegotiationneeded has a handler when it fires
   pc.onnegotiationneeded = async () => {
-    const meta = state.peerMeta.get(peerName);
     try {
       meta.makingOffer = true;
-      await pc.setLocalDescription();
+      // Explicit createOffer — more compatible than setLocalDescription() with no args
+      const offer = await pc.createOffer();
+      if (pc.signalingState !== 'stable') return; // gave up due to glare
+      await pc.setLocalDescription(offer);
       send({ type: 'sdp', to: peerName, sdp: pc.localDescription });
     } catch(e) {
-      console.error(`[WebRTC:${peerName}] negotiation error:`, e);
+      console.error(`[WebRTC:${peerName}] onnegotiationneeded error:`, e);
     } finally {
       meta.makingOffer = false;
     }
@@ -561,6 +563,10 @@ function openPeer(peerName) {
     const icons = { connecting: '⏳', failed: '❌', disconnected: '🔌' };
     badge.textContent = pc.connectionState === 'connected' ? '' : (icons[pc.connectionState] ?? '');
   };
+
+  // Add local mic track AFTER handlers — onnegotiationneeded must already be set
+  const stream = state.rawStream;
+  if (stream) stream.getTracks().forEach(t => pc.addTrack(t, stream));
 }
 
 async function onRemoteSdp(peerName, sdp) {
@@ -573,13 +579,18 @@ async function onRemoteSdp(peerName, sdp) {
   if (meta.ignoreOffer) return;
 
   try {
+    // Polite peer: if we have a pending local offer, roll it back before accepting theirs
+    if (sdp.type === 'offer' && pc.signalingState === 'have-local-offer') {
+      await pc.setLocalDescription({ type: 'rollback' });
+    }
     await pc.setRemoteDescription(sdp);
     if (sdp.type === 'offer') {
-      await pc.setLocalDescription();
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
       send({ type: 'sdp', to: peerName, sdp: pc.localDescription });
     }
   } catch(e) {
-    console.error(`[WebRTC:${peerName}] setRemoteDescription error:`, e);
+    console.error(`[WebRTC:${peerName}] onRemoteSdp error:`, e);
   }
 }
 
