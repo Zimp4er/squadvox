@@ -12,7 +12,7 @@ const state = {
   turnHost:     'squadvox.ru',
   ws:           null,
   peers:        new Map(),    // peerName → RTCPeerConnection
-  peerMeta:     new Map(),    // peerName → { makingOffer, ignoreOffer }
+  peerMeta:     new Map(),    // peerName → { makingOffer, ignoreOffer, polite }
   rawStream:    null,
   localStream:  null,
   isMuted:      false,
@@ -29,56 +29,33 @@ const state = {
 };
 
 // ── Audio output ───────────────────────────────────────────────────────────────
-// One shared AudioContext + MediaStreamDestination + <audio> for all peers.
-// Each peer gets its own GainNode so volume can be adjusted per-user.
+// One <audio> element per peer — direct srcObject, no AudioContext.
+// Same approach as video (srcObject on <video>) — most reliable in WebView2.
 
-let _outCtx     = null;
-let _outDest    = null;
-let _outEl      = null;
-let _outHB      = null; // heartbeat to keep context alive
-const _peerGain = new Map(); // peerName → GainNode
-
-function ensureOutputCtx() {
-  if (_outCtx && _outCtx.state !== 'closed') {
-    if (_outCtx.state === 'suspended') _outCtx.resume().catch(() => {});
-    return;
+function getPeerAudioEl(peerName) {
+  let el = document.getElementById(`audio-${peerName}`);
+  if (!el) {
+    el = document.createElement('audio');
+    el.id       = `audio-${peerName}`;
+    el.autoplay = true;
+    document.body.appendChild(el);
   }
-  _outCtx  = new AudioContext();
-  _outDest = _outCtx.createMediaStreamDestination();
-  _outCtx.resume().catch(() => {});
-
-  // Keep the context alive — browsers can suspend it after a few seconds of silence
-  if (_outHB) clearInterval(_outHB);
-  _outHB = setInterval(() => {
-    if (_outCtx?.state === 'suspended') _outCtx.resume().catch(() => {});
-  }, 2000);
-
-  if (_outEl) _outEl.remove();
-  _outEl = Object.assign(document.createElement('audio'), { autoplay: true });
-  _outEl.srcObject = _outDest.stream;
-  document.body.appendChild(_outEl);
-  _outEl.play().catch(() => {});
-}
-
-function destroyOutputCtx() {
-  if (_outHB) { clearInterval(_outHB); _outHB = null; }
-  _peerGain.clear();
-  if (_outCtx) { _outCtx.close(); _outCtx = null; }
-  if (_outEl)  { _outEl.remove(); _outEl  = null; }
-  _outDest = null;
+  return el;
 }
 
 function connectPeerAudio(peerName, stream) {
-  ensureOutputCtx();
-  // Disconnect old source for this peer if any (e.g. renegotiation)
-  _peerGain.get(peerName)?.disconnect();
+  const el = getPeerAudioEl(peerName);
+  el.srcObject = stream;
+  el.muted     = state.isDeafened;
+  el.volume    = Math.min(1, parseFloat(localStorage.getItem(`sv_vol_${peerName}`) || '1'));
+  if (el.setSinkId && state.outputDevice) el.setSinkId(state.outputDevice).catch(() => {});
+  el.play().catch(err => console.warn('[audio] play() blocked:', err));
+  console.log(`[audio] connected peer ${peerName}, tracks: ${stream.getAudioTracks().length}`);
+}
 
-  const src  = _outCtx.createMediaStreamSource(stream);
-  const gain = _outCtx.createGain();
-  gain.gain.value = parseFloat(localStorage.getItem(`sv_vol_${peerName}`) || '1');
-  src.connect(gain);
-  gain.connect(_outDest);
-  _peerGain.set(peerName, gain);
+function removePeerAudio(peerName) {
+  const el = document.getElementById(`audio-${peerName}`);
+  if (el) { el.srcObject = null; el.remove(); }
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
@@ -86,8 +63,8 @@ function connectPeerAudio(peerName, stream) {
 const $ = id => document.getElementById(id);
 
 function setStatus(text) {
-  const el = $('status-text');       if (el) el.textContent = text;
-  const vs = $('vbar-state');        if (vs) vs.textContent = text;
+  const el = $('status-text');      if (el) el.textContent = text;
+  const vs = $('vbar-state');       if (vs) vs.textContent = text;
   const cs = $('conn-status-text'); if (cs) cs.textContent = text;
 }
 
@@ -399,9 +376,7 @@ async function handleMessage(msg) {
     // ── Voice channel ─────────────────────────────────────────────────────────
 
     case 'channel-members':
-      // We just joined; server lists who's already here.
-      // Open a peer to each — they'll do the same on channel-joined.
-      // Perfect Negotiation resolves any simultaneous offer glare.
+      console.log('[channel] channel-members:', msg.users);
       for (const u of msg.users) {
         addChannelMember(u);
         if (state.isInCall && !state.peers.has(u)) openPeer(u);
@@ -409,6 +384,7 @@ async function handleMessage(msg) {
       break;
 
     case 'channel-joined':
+      console.log('[channel] channel-joined:', msg.username, 'isInCall:', state.isInCall);
       addChannelMember(msg.username); playSound('join');
       if (state.isInCall && !state.peers.has(msg.username)) openPeer(msg.username);
       break;
@@ -416,9 +392,10 @@ async function handleMessage(msg) {
     case 'channel-left':
       removeChannelMember(msg.username); closePeer(msg.username); playSound('leave'); break;
 
-    // ── WebRTC signaling (Perfect Negotiation) ────────────────────────────────
+    // ── WebRTC signaling ──────────────────────────────────────────────────────
 
     case 'sdp':
+      console.log('[webrtc] got sdp from', msg.from, 'type:', msg.sdp?.type);
       if (!state.isInCall) { try { await beginCall(); } catch { break; } }
       if (!state.peers.has(msg.from)) openPeer(msg.from);
       await onRemoteSdp(msg.from, msg.sdp);
@@ -428,14 +405,16 @@ async function handleMessage(msg) {
       if (msg.candidate && state.peers.has(msg.from)) await onRemoteIce(msg.from, msg.candidate);
       break;
 
-    // Legacy types — server just relays, so old 'offer'/'answer' still arrive as-is
+    // Legacy offer/answer support
     case 'offer':
+      console.log('[webrtc] got offer (legacy) from', msg.from);
       if (!state.isInCall) { try { await beginCall(); } catch { break; } }
       if (!state.peers.has(msg.from)) openPeer(msg.from);
       await onRemoteSdp(msg.from, msg.sdp);
       break;
 
     case 'answer':
+      console.log('[webrtc] got answer (legacy) from', msg.from);
       if (state.peers.has(msg.from)) await onRemoteSdp(msg.from, msg.sdp); break;
 
     case 'pong': break;
@@ -471,7 +450,7 @@ function appendChatToEl(container, from, text, ts) {
 }
 
 function updateChatBadge(n) {
-  const b = $('chat-badge'),          sb = $('chat-badge-sidebar');
+  const b = $('chat-badge'), sb = $('chat-badge-sidebar');
   if (b)  { b.textContent  = n; b.style.display  = n > 0 ? '' : 'none'; }
   if (sb) { sb.textContent = n; sb.style.display = n > 0 ? '' : 'none'; }
 }
@@ -482,8 +461,7 @@ $('global-chat-form').addEventListener('submit', e => {
   send({ type: 'chat-message', text });
   appendBothChats(state.username, text, Date.now(), false);
   input.value = '';
-  state.chatUnread = Math.max(0, state.chatUnread - 1);
-  updateChatBadge(state.chatUnread);
+  state.chatUnread = Math.max(0, state.chatUnread - 1); updateChatBadge(state.chatUnread);
 });
 
 $('chat-form').addEventListener('submit', e => {
@@ -492,8 +470,7 @@ $('chat-form').addEventListener('submit', e => {
   send({ type: 'chat-message', text });
   appendBothChats(state.username, text, Date.now(), false);
   input.value = '';
-  state.chatUnread = Math.max(0, state.chatUnread - 1);
-  updateChatBadge(state.chatUnread);
+  state.chatUnread = Math.max(0, state.chatUnread - 1); updateChatBadge(state.chatUnread);
 });
 
 // ── WebRTC ─────────────────────────────────────────────────────────────────────
@@ -511,30 +488,32 @@ function iceConfig() {
   return { iceServers: servers };
 }
 
-// Perfect Negotiation — open connection to `peerName`.
-// Both sides call openPeer independently; glare is resolved by polite/impolite roles.
-// Polite peer = lexicographically larger username (deterministic on both ends).
+// Perfect Negotiation — both sides call openPeer independently.
+// Polite = lexicographically larger username (deterministic on both ends).
 function openPeer(peerName) {
   if (state.peers.has(peerName)) return;
+  console.log(`[webrtc] openPeer(${peerName}), rawStream tracks:`, state.rawStream?.getTracks().length ?? 0);
 
-  const pc = new RTCPeerConnection(iceConfig());
-  state.peers.set(peerName, pc);
-
-  // Plain object — simpler than getters/setters, works the same way
+  const pc   = new RTCPeerConnection(iceConfig());
   const meta = { makingOffer: false, ignoreOffer: false, polite: state.username > peerName };
+  state.peers.set(peerName, pc);
   state.peerMeta.set(peerName, meta);
 
-  // Set ALL event handlers BEFORE addTrack so onnegotiationneeded has a handler when it fires
+  // Handlers BEFORE addTrack so onnegotiationneeded is wired when it fires
   pc.onnegotiationneeded = async () => {
+    console.log(`[webrtc:${peerName}] onnegotiationneeded, signalingState=${pc.signalingState}`);
     try {
       meta.makingOffer = true;
-      // Explicit createOffer — more compatible than setLocalDescription() with no args
       const offer = await pc.createOffer();
-      if (pc.signalingState !== 'stable') return; // gave up due to glare
+      if (pc.signalingState !== 'stable') {
+        console.log(`[webrtc:${peerName}] state not stable after createOffer, skipping`);
+        return;
+      }
       await pc.setLocalDescription(offer);
+      console.log(`[webrtc:${peerName}] sending offer`);
       send({ type: 'sdp', to: peerName, sdp: pc.localDescription });
     } catch(e) {
-      console.error(`[WebRTC:${peerName}] onnegotiationneeded error:`, e);
+      console.error(`[webrtc:${peerName}] onnegotiationneeded error:`, e);
     } finally {
       meta.makingOffer = false;
     }
@@ -544,7 +523,12 @@ function openPeer(peerName) {
     if (candidate) send({ type: 'ice', to: peerName, candidate });
   };
 
+  pc.oniceconnectionstatechange = () => {
+    console.log(`[webrtc:${peerName}] iceConnectionState: ${pc.iceConnectionState}`);
+  };
+
   pc.ontrack = ({ track, streams }) => {
+    console.log(`[webrtc:${peerName}] ontrack: kind=${track.kind}, streams=${streams.length}, streamActive=${streams[0]?.active}`);
     if (track.kind === 'audio') {
       const s = streams[0] || new MediaStream([track]);
       connectPeerAudio(peerName, s);
@@ -557,6 +541,7 @@ function openPeer(peerName) {
   };
 
   pc.onconnectionstatechange = () => {
+    console.log(`[webrtc:${peerName}] connectionState: ${pc.connectionState}`);
     const tile  = $(`pt-${peerName}`); if (!tile) return;
     tile.dataset.conn = pc.connectionState;
     const badge = tile.querySelector('.pt-conn'); if (!badge) return;
@@ -564,9 +549,16 @@ function openPeer(peerName) {
     badge.textContent = pc.connectionState === 'connected' ? '' : (icons[pc.connectionState] ?? '');
   };
 
-  // Add local mic track AFTER handlers — onnegotiationneeded must already be set
+  // addTrack AFTER handlers
   const stream = state.rawStream;
-  if (stream) stream.getTracks().forEach(t => pc.addTrack(t, stream));
+  if (stream) {
+    stream.getTracks().forEach(t => {
+      console.log(`[webrtc:${peerName}] addTrack kind=${t.kind} enabled=${t.enabled}`);
+      pc.addTrack(t, stream);
+    });
+  } else {
+    console.warn(`[webrtc:${peerName}] openPeer: rawStream is null!`);
+  }
 }
 
 async function onRemoteSdp(peerName, sdp) {
@@ -574,23 +566,29 @@ async function onRemoteSdp(peerName, sdp) {
   const meta = state.peerMeta.get(peerName);
   if (!pc || !meta) return;
 
+  console.log(`[webrtc:${peerName}] onRemoteSdp type=${sdp.type}, signalingState=${pc.signalingState}, makingOffer=${meta.makingOffer}, polite=${meta.polite}`);
+
   const offerCollision = sdp.type === 'offer' && (meta.makingOffer || pc.signalingState !== 'stable');
-  meta.ignoreOffer = !meta.polite && offerCollision;
-  if (meta.ignoreOffer) return;
+  meta.ignoreOffer     = !meta.polite && offerCollision;
+  if (meta.ignoreOffer) {
+    console.log(`[webrtc:${peerName}] ignoring offer (impolite peer, collision)`);
+    return;
+  }
 
   try {
-    // Polite peer: if we have a pending local offer, roll it back before accepting theirs
     if (sdp.type === 'offer' && pc.signalingState === 'have-local-offer') {
+      console.log(`[webrtc:${peerName}] rolling back local offer (polite peer)`);
       await pc.setLocalDescription({ type: 'rollback' });
     }
     await pc.setRemoteDescription(sdp);
     if (sdp.type === 'offer') {
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
+      console.log(`[webrtc:${peerName}] sending answer`);
       send({ type: 'sdp', to: peerName, sdp: pc.localDescription });
     }
   } catch(e) {
-    console.error(`[WebRTC:${peerName}] onRemoteSdp error:`, e);
+    console.error(`[webrtc:${peerName}] onRemoteSdp error:`, e);
   }
 }
 
@@ -601,7 +599,7 @@ async function onRemoteIce(peerName, candidate) {
   try {
     await pc.addIceCandidate(candidate);
   } catch(e) {
-    if (!meta?.ignoreOffer) console.error(`[WebRTC:${peerName}] addIceCandidate error:`, e);
+    if (!meta?.ignoreOffer) console.error(`[webrtc:${peerName}] addIceCandidate error:`, e);
   }
 }
 
@@ -609,9 +607,9 @@ function closePeer(peerName) {
   state.peers.get(peerName)?.close();
   state.peers.delete(peerName);
   state.peerMeta.delete(peerName);
-  _peerGain.get(peerName)?.disconnect();
-  _peerGain.delete(peerName);
+  removePeerAudio(peerName);
   stopVAD(peerName);
+  console.log(`[webrtc] closePeer(${peerName})`);
 }
 
 // ── Voice channel ──────────────────────────────────────────────────────────────
@@ -656,13 +654,13 @@ function addChannelMember(username) {
     const volWrap  = document.createElement('div'); volWrap.className = 'pt-volume-wrap';
     const volLabel = document.createElement('span'); volLabel.className = 'pt-volume-label'; volLabel.textContent = '🔊';
     const slider   = document.createElement('input');
-    slider.type = 'range'; slider.min = '0'; slider.max = '200'; slider.className = 'pt-volume';
-    slider.value = Math.round((parseFloat(localStorage.getItem(`sv_vol_${username}`) || '1')) * 100);
+    slider.type = 'range'; slider.min = '0'; slider.max = '100'; slider.className = 'pt-volume';
+    slider.value = Math.round(Math.min(100, (parseFloat(localStorage.getItem(`sv_vol_${username}`) || '1')) * 100));
     slider.addEventListener('input', () => {
       const vol = slider.value / 100;
       localStorage.setItem(`sv_vol_${username}`, vol);
-      const gain = _peerGain.get(username);
-      if (gain) gain.gain.value = vol;
+      const el = document.getElementById(`audio-${username}`);
+      if (el) el.volume = vol;
     });
     volWrap.appendChild(volLabel); volWrap.appendChild(slider);
     tile.appendChild(av); tile.appendChild(name); tile.appendChild(conn); tile.appendChild(volWrap);
@@ -687,15 +685,16 @@ async function beginCall() {
   const deviceId   = $('settings-mic')?.value || '';
   const constraint = deviceId ? { deviceId: { exact: deviceId } } : true;
   try {
+    console.log('[call] getUserMedia...');
     state.rawStream   = await navigator.mediaDevices.getUserMedia({ audio: constraint, video: false });
+    console.log('[call] got rawStream, tracks:', state.rawStream.getTracks().map(t => `${t.kind}:${t.enabled}`));
     state.localStream = await applyNoiseSuppression(state.rawStream);
-  } catch {
+  } catch(err) {
+    console.error('[call] getUserMedia failed:', err);
     setStatus('Нет доступа к микрофону'); throw new Error('mic denied');
   }
   if (state.pttEnabled) setMuted(true);
-  ensureOutputCtx();
   await loadAudioDevices();
-  if (state.outputDevice && _outEl?.setSinkId) _outEl.setSinkId(state.outputDevice).catch(() => {});
   state.isInCall = true;
   localStorage.setItem('sv_in_channel', '1');
   $('voice-bar').style.display      = '';
@@ -705,13 +704,16 @@ async function beginCall() {
   setStatus('В канале');
   addChannelMember(state.username);
   startVAD(state.username, state.rawStream);
+  console.log('[call] beginCall complete, isInCall=true');
 }
 
 function teardownCall() {
   state.rawStream?.getTracks().forEach(t => t.stop());
   state.localStream?.getTracks().forEach(t => t.stop());
   state.rawStream = null; state.localStream = null;
-  destroyNoise(); destroyOutputCtx();
+  destroyNoise();
+  // Remove all peer audio elements
+  document.querySelectorAll('[id^="audio-"]').forEach(el => { el.srcObject = null; el.remove(); });
   state.isInCall   = false;
   state.isMuted    = false;
   state.isDeafened = false;
@@ -758,7 +760,7 @@ $('mute-btn').addEventListener('click', () => { if (!state.pttEnabled) setMuted(
 
 $('deafen-btn').addEventListener('click', () => {
   state.isDeafened = !state.isDeafened;
-  if (_outEl) _outEl.muted = state.isDeafened;
+  document.querySelectorAll('[id^="audio-"]').forEach(el => { el.muted = state.isDeafened; });
   updateDeafenUI();
 });
 
@@ -861,7 +863,9 @@ async function switchMicrophone(deviceId) {
 async function applyOutputDevice(deviceId) {
   state.outputDevice = deviceId;
   localStorage.setItem('sv_output_device', deviceId);
-  if (_outEl?.setSinkId) await _outEl.setSinkId(deviceId).catch(() => {});
+  document.querySelectorAll('[id^="audio-"]').forEach(el => {
+    if (el.setSinkId) el.setSinkId(deviceId).catch(() => {});
+  });
 }
 
 $('settings-mic').addEventListener('change', () => {
